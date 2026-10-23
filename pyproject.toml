@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netbox-subnet-wizard"
+version = "0.1.0"
+description = "Guided wizard for allocating child prefixes (and optional gateway IPs) in NetBox"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["netbox_subnet_wizard*"]
+
+[tool.setuptools.package-data]
+netbox_subnet_wizard = ["templates/netbox_subnet_wizard/*.html"]

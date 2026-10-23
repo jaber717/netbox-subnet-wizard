@@ -1,0 +1,68 @@
+# Throwaway NetBox 4.6 for testing netbox-subnet-wizard.
+#   Start:   docker compose up -d --build
+#   Delete:  docker compose down -v --rmi local
+name: netbox-wizard-demo
+
+x-netbox-env: &netbox-env
+  DB_HOST: postgres
+  DB_NAME: netbox
+  DB_USER: netbox
+  DB_PASSWORD: netbox
+  REDIS_HOST: redis
+  REDIS_PASSWORD: ""
+  REDIS_CACHE_HOST: redis
+  REDIS_CACHE_PASSWORD: ""
+  SECRET_KEY: "demo-only-not-secret-0123456789abcdefghijklmnopqrstuvwxyz"
+  SKIP_SUPERUSER: "false"
+  SUPERUSER_NAME: admin
+  SUPERUSER_EMAIL: admin@example.com
+  SUPERUSER_PASSWORD: admin
+  ALLOWED_HOSTS: "*"
+
+services:
+  netbox:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment: *netbox-env
+    ports:
+      - "8000:8080"
+    volumes:
+      - ./plugins.py:/etc/netbox/config/plugins.py:ro
+      - ..:/opt/plugins/netbox-subnet-wizard:ro
+    healthcheck:
+      test: curl -f http://localhost:8080/login/ || exit 1
+      start_period: 180s
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: netbox
+      POSTGRES_USER: netbox
+      POSTGRES_PASSWORD: netbox
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready -q -U netbox -d netbox
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: valkey/valkey:8.1-alpine
+    healthcheck:
+      test: valkey-cli ping | grep PONG
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
