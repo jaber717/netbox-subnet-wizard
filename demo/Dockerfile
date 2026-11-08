@@ -1,4 +1,4 @@
-FROM netboxcommunity/netbox:v4.6
+FROM netboxcommunity/netbox:v4.6.9
 
 # Editable install: docker-compose bind-mounts the plugin source over this path,
 # so code edits only need a container restart, not a rebuild.

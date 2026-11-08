@@ -1,131 +1,156 @@
 # NetBox Subnet Wizard
 
-A NetBox 4.6 plugin that allocates one or more child prefixes from a parent container prefix, with a preview before anything is saved.
+phpIPAM-style subnetting for NetBox 4.6: open a block, see what is free, split it into equal
+child prefixes, tick the ones you want, review the exact list, confirm. Blocks can be reserved for
+the future and split again later.
 
-## What it does
+> **0.2.0rc1 is a release candidate.** Do not deploy to production until it has passed your own
+> acceptance on a copy of production data (see [Testing](#testing)).
 
-1. Pick a parent **Container** prefix, the size of the new prefixes (e.g. /24) and how many you need.
-2. Choose an allocation strategy. It decides which prefixes are pre-selected in the preview:
-   - **First fit**: lowest free addresses first.
-   - **Best fit**: fills the smallest free gaps first, keeping large blocks intact.
-3. Set the status, role, tenant and description for the new prefixes. In the description, `{n}` becomes a sequence number and `{prefix}` becomes the prefix itself.
-4. Optionally create a gateway IP, the first usable address, in each prefix. This is skipped for /31, /32, /127 and /128.
-5. Click **Preview** to list every free prefix of that size in the parent, with the strategy's picks ticked. Tick or untick any of them, then click **Create selected**. Click **Preview** again after changing ticks to refresh the `{n}` numbering.
+## Workflow
 
-New prefixes inherit the parent's VRF and scope (site, location, region and so on). All prefixes are created in one transaction: either all of them are created or none are.
+1. Open any **Container** or **Reserved** prefix and click **Split / Reserve**
+   (or *Plugins → Split / Reserve Prefix*).
+2. The left side shows **what is available**: free addresses, free blocks, and how many child
+   prefixes already exist per status (each links to the filtered prefix list).
+3. **Split into**: a dropdown of every valid size with live counts, e.g.
+   `/30 — 64 blocks, 60 free`, `/31 — 128 blocks, 120 free`.
+4. Choose status (default **Reserved**), role and tenant (pre-filled from the parent), and an
+   optional description template (`WAN-P2P-{n}`, `{prefix}`).
+5. **Show free blocks** lists every free block with a checkbox. **Select all free**, **Clear**,
+   or *Quick-select N* (lowest first, or smallest gaps first to keep big blocks intact).
+6. **Review selected** shows exactly what will be written. Selections of 16 or more require
+   typing the count. Blocks that contain existing IPs or IP ranges are flagged and need an
+   explicit acknowledgement.
+7. **Create** writes everything in one transaction and returns to the parent's child prefixes.
 
-Before creating, the wizard locks the parent prefix and checks that every ticked prefix is still free. If one was taken since your preview, nothing is created and the updated list is shown. Changing the parent, size, count or strategy after a preview also requires a new preview before creating.
+### Planning ahead
 
-Changes appear in the NetBox change log under your user, the same as any UI edit.
+Split a /22 into four /24s with status **Reserved** and roles *WAN*, *DMZ*, *Inner*, *Public*.
+Later, open the reserved DMZ /24 and split it into /28s. The confirm page offers to change that
+/24 from Reserved to **Container** in the same transaction (default on, logged in the change log).
 
-## Where to find it
+## What changed from 0.1.0
 
-- **Plugins → Subnet Wizard** in the navigation menu.
-- A **Subnet Wizard** button on any prefix with status Container. It opens the wizard with that prefix pre-selected.
+See [CHANGELOG.md](CHANGELOG.md). Short version: no more HTTP 500 on model validation errors,
+no webhooks for rolled-back objects, the core allocator lock is honoured, server-side parent
+checks, duplicate-gateway protection, a signed review step, and the new UI.
 
-## Requirements
+## Safety model
 
-- NetBox 4.6.x
-- Python 3.12+
+**All-or-nothing.** Prefixes, gateway IPs and the optional parent conversion are one
+transaction. On any refusal (validation, permission constraint, concurrent change) nothing is
+written and queued events are discarded (`core.signals.clear_events`), so no webhook or event
+rule fires for objects that never existed. Verified with a real webhook receiver in
+`tests/test_events.py`.
 
-## Installation (no internet on the NetBox server)
+**Signed review.** The confirm step accepts only a plan signed by the server
+(`django.core.signing`, bound to user, parent and selection, valid 15 minutes). Hand-crafted or
+replayed POSTs cannot skip the review; availability is still re-checked under lock at confirm.
 
-The plugin ships as a single file, a Python wheel, attached to each [GitHub release](../../releases). It has no dependencies beyond NetBox itself, so the server never needs to reach GitHub or PyPI.
+**Parent checks (server side).** Only statuses in `allowed_parent_statuses`; parents marked
+*fully utilised* are refused (NetBox's own `get_available_prefixes()` ignores that flag).
 
-1. **On your Windows PC**, open the [latest release](../../releases/latest) and download `netbox_subnet_wizard-<version>-py3-none-any.whl`.
+**Permissions.** `ipam.add_prefix` to use the wizard, `ipam.add_ipaddress` for gateways,
+`ipam.change_prefix` on the parent to convert it. Object-level constraints are enforced; a
+violation rolls back the whole run and is shown as a message.
 
-2. **Copy the file to the NetBox server.** Either drag and drop it into `/tmp` with WinSCP, or use the `scp` built into PowerShell:
+### Global vs VRF space (`global_parent_policy`)
 
-   ```powershell
-   scp $HOME\Downloads\netbox_subnet_wizard-0.1.0-py3-none-any.whl you@netbox-server:/tmp/
-   ```
+| Parent | Counts as occupied | Overlap with other VRFs |
+|---|---|---|
+| In a VRF | prefixes in **that VRF only** | always allowed (isolated) |
+| Global, `all_vrfs` (default) | prefixes in **any VRF** (umbrella, matches NetBox's child list) | prevented |
+| Global, `same_vrf` | global prefixes only (matches `get_available_prefixes()`) | allowed |
 
-3. **On the server**, keep the wheel somewhere permanent and install it into NetBox's virtual environment. `--no-index` stops pip from trying to reach the internet:
+New prefixes always inherit the parent's VRF and scope.
 
-   ```bash
-   sudo mkdir -p /opt/netbox/plugins
-   sudo mv /tmp/netbox_subnet_wizard-0.1.0-py3-none-any.whl /opt/netbox/plugins/
-   sudo /opt/netbox/venv/bin/pip install --no-index /opt/netbox/plugins/netbox_subnet_wizard-0.1.0-py3-none-any.whl
-   ```
+### Concurrency
 
-   So that NetBox's `upgrade.sh` reinstalls the plugin after a NetBox upgrade, add the same path to `local_requirements.txt`:
+| Other writer | Result |
+|---|---|
+| Another wizard run | serialised (advisory lock + parent row lock) |
+| `POST /api/ipam/prefixes/<id>/available-prefixes/` | serialised: same advisory lock `100100` |
+| Native create already **committed** before the wizard finishes | detected: duplicate check or pre-commit overlap check → clean refusal, nothing written |
+| Native create (UI form, `POST /api/ipam/prefixes/`) **in flight at the same moment, same VRF, same prefix** | **not prevented** — see below |
 
-   ```bash
-   echo /opt/netbox/plugins/netbox_subnet_wizard-0.1.0-py3-none-any.whl | sudo tee -a /opt/netbox/local_requirements.txt
-   ```
+**Residual risk.** NetBox has no database constraint against duplicate prefixes. A native
+create in the same VRF whose transaction overlaps a wizard run checks for duplicates before
+either side has committed, then commits right after the wizard: a duplicate results, even with
+`enforce_unique`. NetBox core has the same blind spot between two native writers. The window
+is the duration of a wizard run (about 2 s for 128 prefixes on the test system). The wizard
+page lists exact duplicates in the block on every visit, and a post-commit check reports what
+it can see. Eliminating it requires a unique index on `ipam_prefix`, which this plugin does not
+add. Operational mitigation: allocate P2P and planned space only through the wizard or the
+`available-prefixes` API. Pinned by
+`test_residual_race_with_native_rest_create_is_detected_not_prevented`.
 
-4. **Enable the plugin** in `/opt/netbox/netbox/netbox/configuration.py`:
+## Configuration
 
-   ```python
-   PLUGINS = ['netbox_subnet_wizard']
+```python
+PLUGINS_CONFIG = {
+    'netbox_subnet_wizard': {
+        'max_subnets': 256,                 # per run; /24 -> /31 needs 128
+        'max_preview': 512,                 # rows in the preview table
+        'mass_confirm_threshold': 16,       # type the count at or above this size
+        'default_status': 'reserved',
+        'allowed_parent_statuses': ['container', 'reserved'],
+        'allow_mark_utilized_parent': False,
+        'global_parent_policy': 'all_vrfs', # or 'same_vrf'
+        'gateway_max_length_v4': 29,        # no gateway for /30, /31, /32
+        'gateway_max_length_v6': 125,
+        'gateway_status': 'active',
+        'gateway_description': 'Gateway',
+        'plan_max_age': 900,                # seconds a review stays valid
+    },
+}
+```
 
-   PLUGINS_CONFIG = {
-       'netbox_subnet_wizard': {
-           'max_subnets': 64,          # most prefixes created in one run
-           'max_preview': 256,         # most free prefixes listed in the preview
-           'default_status': 'active', # pre-selected status for new prefixes
-           'gateway_status': 'active',
-           'gateway_description': 'Gateway',
-       },
-   }
-   ```
+## Installation from GitHub (on the NetBox server)
 
-   If `PLUGINS` already lists other plugins, add `'netbox_subnet_wizard'` to that list rather than adding a second `PLUGINS` line.
-
-5. **Restart NetBox:**
-
-   ```bash
-   sudo /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py collectstatic --no-input
-   sudo systemctl restart netbox netbox-rq
-   ```
-
-   The plugin has no models, so there are no migrations.
-
-6. **Check it loaded:** **Admin → System → Plugins** should list *Subnet Wizard*, and container prefixes get a **Subnet Wizard** button.
-
-### Upgrading
-
-Download the new wheel and repeat steps 2–3 with the new file name, then update the path in `local_requirements.txt` and restart NetBox (step 5).
-
-### Uninstalling
-
-Remove `'netbox_subnet_wizard'` from `PLUGINS`, then run `sudo /opt/netbox/venv/bin/pip uninstall netbox-subnet-wizard`, remove its line from `local_requirements.txt` and restart NetBox.
-
-### Building the wheel yourself
+No runtime dependencies beyond NetBox. Pin a tag; never install a moving branch.
 
 ```bash
-pip install build
-python -m build --wheel   # writes dist/netbox_subnet_wizard-<version>-py3-none-any.whl
+# Build backend comes from NetBox's own venv, so pip does not need PyPI:
+sudo /opt/netbox/venv/bin/pip install --no-build-isolation \
+  "git+https://github.com/<your-org>/netbox-subnet-wizard.git@v0.2.0rc1"
+echo 'git+https://github.com/<your-org>/netbox-subnet-wizard.git@v0.2.0rc1' | sudo tee -a /opt/netbox/local_requirements.txt
 ```
 
-## Trying it locally
+Behind an SSL-inspecting proxy, point git at the corporate CA
+(`git config --global http.sslCAInfo /etc/pki/ca-trust/source/anchors/corp.pem`) and export
+`https_proxy`. `--no-build-isolation` requires `setuptools>=68` and `wheel` in the NetBox venv
+(present in standard installs; check with `pip show setuptools wheel`).
 
-`demo/` has a throwaway NetBox in Docker with the plugin installed and sample prefixes. See [demo/README.md](demo/README.md).
+Add `'netbox_subnet_wizard'` to `PLUGINS`, then:
 
-## Permissions
-
-- To use the wizard, users need `ipam.add_prefix`.
-- To use the gateway option, users also need `ipam.add_ipaddress`.
-- The parent picker only lists prefixes the user can view.
-- NetBox object-level permission constraints are enforced. If a constraint would block any of the new objects, the whole run is rolled back.
-
-## Notes and limitations
-
-- Only prefixes are allocated. VLANs, IP ranges and DNS records are not created.
-- Free space comes from NetBox's own `get_available_prefixes()`. If the parent is marked as fully utilised, it has no free space.
-- The gateway IP has no role set (NetBox has no "gateway" role). Its status and description come from `PLUGINS_CONFIG`.
-
-## Structure
-
+```bash
+sudo /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py collectstatic --no-input
+sudo systemctl restart netbox netbox-rq
 ```
-demo/                    # Docker NetBox for local testing
-netbox_subnet_wizard/
-├── __init__.py          # PluginConfig and default settings
-├── forms.py             # Wizard form and validation
-├── navigation.py        # Plugins menu entry
-├── template_content.py  # Button on container prefix pages
-├── urls.py
-├── utils.py             # Allocation logic (first fit / best fit, gateway)
-├── views.py             # Preview and transactional create
-└── templates/netbox_subnet_wizard/wizard.html
+
+No models, no migrations. Uninstall: remove from `PLUGINS`, `pip uninstall netbox-subnet-wizard`.
+
+## Testing
+
+Tests live in `netbox_subnet_wizard/tests/` (excluded from the wheel) and need a NetBox 4.6
+checkout with PostgreSQL and Redis:
+
+```bash
+cd /path/to/netbox/netbox
+pip install -e /path/to/netbox-subnet-wizard        # editable, so tests are importable
+python manage.py test netbox_subnet_wizard -v 2
 ```
+
+Coverage: UI workflow, persistence and change log for /24→64×/30 and /24→128×/31, signed-plan
+tampering/replay/expiry, parent validation, VRF policy, IP/range conflicts, gateways,
+permissions, event queue, **real webhook delivery** through an RQ worker to an HTTP receiver,
+and concurrency with separate PostgreSQL connections (core API lock in both directions,
+committed native writer, and the residual race).
+
+## Limitations
+
+- Prefixes only (and optional gateway IPs). No VLANs, IP ranges or DNS.
+- New prefixes inherit the parent VRF; no per-run VRF override.
+- No merge of adjacent prefixes.
+- Preview shows at most `max_preview` rows; *Select all free* selects those rows only.

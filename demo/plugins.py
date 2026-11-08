@@ -3,9 +3,8 @@ PLUGINS = ['netbox_subnet_wizard']
 
 PLUGINS_CONFIG = {
     'netbox_subnet_wizard': {
-        'max_subnets': 64,
-        'default_status': 'active',
-        'gateway_status': 'active',
-        'gateway_description': 'Gateway',
+        'max_subnets': 256,
+        'default_status': 'reserved',
+        'global_parent_policy': 'all_vrfs',
     },
 }

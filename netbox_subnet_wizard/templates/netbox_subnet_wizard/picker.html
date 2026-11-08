@@ -1,0 +1,26 @@
+{% extends 'base/layout.html' %}
+{% load form_helpers %}
+{% load i18n %}
+
+{% block title %}{% trans "Split / Reserve Prefix" %}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-12 col-lg-7">
+    <form method="get" class="form-object-edit">
+      <div class="field-group my-4">
+        <div class="row"><h2 class="col-9 offset-3">{% trans "Which block do you want to split?" %}</h2></div>
+        {% render_field form.parent %}
+      </div>
+      <div class="text-end my-3">
+        <button type="submit" class="btn btn-primary">{% trans "Open" %}</button>
+      </div>
+    </form>
+  </div>
+  <div class="col col-12 col-lg-5">
+    <div class="card"><div class="card-body text-muted">
+      {% blocktrans %}Pick a container or reserved prefix. You will see its free space, choose a size, tick the blocks you want and confirm. Nothing is saved until you confirm.{% endblocktrans %}
+    </div></div>
+  </div>
+</div>
+{% endblock %}

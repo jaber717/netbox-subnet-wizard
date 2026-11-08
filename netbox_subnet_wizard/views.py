@@ -1,192 +1,268 @@
+import logging
+
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import transaction
-from django.shortcuts import redirect, render
+from django.http import QueryDict
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.views import View
 
-from ipam.models import IPAddress, Prefix
-from netbox.plugins import get_plugin_config
+from core.signals import clear_events
+from ipam.choices import PrefixStatusChoices
+from ipam.models import Prefix, Role
+from tenancy.models import Tenant
 
-from .forms import PLUGIN, SubnetWizardForm
-from .utils import find_available_subnets, gateway_for, list_available_subnets, render_description
+from . import utils
+from .allocator import AllocationError, Plan, allocate, validate_selection
+from .forms import AllocateForm, ParentPickForm
+from .utils import cfg
 
-
-class _PreviewChanged(Exception):
-    """Raised inside the transaction when ticked prefixes were taken after the preview."""
-
-    def __init__(self, taken):
-        super().__init__()
-        self.taken = taken
+logger = logging.getLogger('netbox.plugins.netbox_subnet_wizard')
 
 
-class SubnetWizardView(LoginRequiredMixin, PermissionRequiredMixin, View):
+def error_messages(exc):
+    """Human-readable lines for any refusal raised by allocate()."""
+    if isinstance(exc, AllocationError):
+        return exc.messages
+    if isinstance(exc, ValidationError):
+        if hasattr(exc, 'error_dict'):
+            return [m if f == '__all__' else f'{f}: {m}'
+                    for f, msgs in exc.message_dict.items() for m in msgs]
+        return exc.messages
+    return [str(exc) or 'Permission denied.']
+
+
+class WizardMixin(LoginRequiredMixin, PermissionRequiredMixin):
     permission_required = 'ipam.add_prefix'
-    template_name = 'netbox_subnet_wizard/wizard.html'
 
-    @staticmethod
-    def preview_key(data):
-        """Identifies the settings a preview was built from."""
-        return f"{data['parent'].pk}:{data['prefix_length']}:{data['count']}:{data['strategy']}"
+    def get_parent(self, request, pk):
+        return get_object_or_404(Prefix.objects.restrict(request.user, 'view'), pk=pk)
+
+
+class PickerView(WizardMixin, View):
+    """Entry point from the menu: choose which block to split."""
+    template_name = 'netbox_subnet_wizard/picker.html'
 
     def get(self, request):
-        initial = {}
         if request.GET.get('parent'):
-            initial['parent'] = request.GET['parent']
-        form = SubnetWizardForm(initial=initial, user=request.user)
+            form = ParentPickForm(request.GET, user=request.user)
+            if form.is_valid():
+                return redirect('plugins:netbox_subnet_wizard:allocate', pk=form.cleaned_data['parent'].pk)
+        else:
+            form = ParentPickForm(user=request.user)
         return render(request, self.template_name, {'form': form})
 
-    def post(self, request):
-        form = SubnetWizardForm(request.POST, user=request.user)
-        if not form.is_valid():
-            return render(request, self.template_name, {'form': form})
 
-        data = form.cleaned_data
-        parent = data['parent']
-        selection = None
+class AllocateView(WizardMixin, View):
+    """Free-space overview, size dropdown, selectable preview. Never writes."""
+    template_name = 'netbox_subnet_wizard/allocate.html'
 
-        if request.POST.get('action') == 'create':
-            max_subnets = get_plugin_config(PLUGIN, 'max_subnets')
-            if data['previewed'] != self.preview_key(data):
-                form.add_error(None, (
-                    'The settings changed since the preview. '
-                    'Review the updated list before creating.'
-                ))
-            elif not data['selected']:
-                form.add_error(None, 'Select at least one prefix to create.')
-                selection = []
-            elif len(data['selected']) > max_subnets:
-                form.add_error(None, f'You can create at most {max_subnets} prefixes at once.')
-                selection = data['selected']
+    def get(self, request, pk):
+        parent = self.get_parent(request, pk)
+        available = utils.available_space(parent)
+        form = AllocateForm(parent=parent, available=available, user=request.user)
+        return self.render_page(request, parent, available, form)
+
+    def post(self, request, pk):
+        parent = self.get_parent(request, pk)
+        return self.handle(request, parent, request.POST, request.POST.get('action', 'preview'))
+
+    def handle(self, request, parent, data, action):
+        available = utils.available_space(parent)
+        form = AllocateForm(data, parent=parent, available=available, user=request.user)
+        if utils.parent_problems(parent) or not form.is_valid():
+            return self.render_page(request, parent, available, form)
+
+        d = form.cleaned_data
+        length = d['prefix_length']
+        candidates, total = utils.list_candidates(available, length, cfg('max_preview'))
+        conflicts = utils.find_conflicts(parent, candidates)
+
+        if action == 'select_all':
+            selection = [c for c in candidates if c not in conflicts][:cfg('max_subnets')]
+        elif action == 'clear':
+            selection = []
+        elif action == 'preview' and d['count'] and (d['length_changed'] or not d['selected']):
+            pool = utils.pick(available, length, d['count'] + len(conflicts), d['strategy'])
+            selection = [s for s in pool if s not in conflicts][:d['count']]
+        elif action == 'review':
+            selection = d['selected']        # validated below; taken blocks are reported by name
+        else:
+            selection = [s for s in d['selected'] if s in available]
+
+        if action == 'review':
+            try:
+                validate_selection(parent, length, selection, available)
+            except AllocationError as e:
+                for m in e.messages:
+                    form.add_error(None, m)
             else:
-                try:
-                    created = self._create(request, data, parent)
-                except _PreviewChanged as e:
-                    messages.warning(request, (
-                        f"{', '.join(str(s) for s in e.taken)} is no longer available. "
-                        'Review the updated list before creating.'
-                    ))
-                    selection = data['selected']
-                except ValidationError as e:
-                    form.add_error(None, e)
-                    selection = data['selected']
-                else:
-                    messages.success(
-                        request,
-                        f'Created {len(created)} prefix(es) in {parent.prefix}.',
-                    )
-                    return redirect(reverse('ipam:prefix_prefixes', kwargs={'pk': parent.pk}))
+                sel_conflicts = utils.find_conflicts(parent, selection)
+                plan = Plan(
+                    user=request.user.pk, parent=parent.pk, length=length,
+                    selected=[str(s) for s in selection], status=d['status'],
+                    role=d['role'].pk if d['role'] else None,
+                    tenant=d['tenant'].pk if d['tenant'] else None,
+                    description=d['description'] or '',
+                    gateway=bool(d['create_gateway']),
+                    conflicts=[str(s) for s in sorted(sel_conflicts)],
+                )
+                return ConfirmView.render_confirm(request, parent, plan, sel_conflicts)
 
-        return self._render_preview(request, form, selection)
-
-    def _render_preview(self, request, form, selection=None):
-        """
-        List the free prefixes in the parent with checkboxes. `selection` is what to
-        tick; by default the user's ticks are kept while the settings are unchanged,
-        and the strategy's picks are used otherwise.
-        """
-        data = form.cleaned_data
-        parent = data['parent']
-        length = data['prefix_length']
-        key = self.preview_key(data)
-
-        if selection is None:
-            if data['previewed'] == key:
-                selection = data['selected']
-            else:
-                selection = find_available_subnets(parent, length, data['count'], data['strategy'])
-
-        listing, total = list_available_subnets(
-            parent, length, get_plugin_config(PLUGIN, 'max_preview')
-        )
-        # Drop ticks that were taken since the last preview
-        available = parent.get_available_prefixes()
-        selection = sorted(s for s in selection if s in available)
-
-        if total < data['count']:
-            form.add_error(None, (
-                f"Only {total} free /{length} block(s) are available in {parent.prefix}."
-            ))
-
-        numbers = {subnet: i for i, subnet in enumerate(selection, start=1)}
-        preview = [
-            {
-                'prefix': subnet,
-                'checked': subnet in numbers,
-                'description': render_description(
-                    data.get('description') or '', numbers[subnet], subnet
-                ) if subnet in numbers else '',
-                'gateway': gateway_for(subnet) if data.get('create_gateway') else None,
-            }
-            for subnet in sorted(set(listing) | set(selection))
-        ]
-
-        post = request.POST.copy()
-        post['previewed'] = key
-        bound = SubnetWizardForm(post, user=request.user)
+        # Re-bind with the computed selection and the length the table now shows
+        post = data.copy()
+        post.setlist('selected', [str(s) for s in selection])
+        post['shown_length'] = str(length)
+        bound = AllocateForm(post, parent=parent, available=available, user=request.user)
         bound.is_valid()
-        for error in form.non_field_errors():
-            if error not in bound.non_field_errors():
-                bound.add_error(None, error)
+        for err in form.non_field_errors():
+            if err not in bound.non_field_errors():
+                bound.add_error(None, err)
 
-        return render(request, self.template_name, {
-            'form': bound,
-            'preview': preview,
-            'preview_total': total,
-            'selected_count': len(selection),
-            'allow_create': bool(preview),
+        chosen = set(selection)
+        numbers = {s: i for i, s in enumerate(sorted(chosen), start=1)}
+        show_gw = d['create_gateway'] and utils.gateway_allowed(length, parent.family)
+        rows = [{
+            'prefix': c,
+            'checked': c in chosen,
+            'conflicts': conflicts.get(c, []),
+            'description': utils.render_description(d['description'], numbers[c], c) if c in chosen else '',
+            'gateway': utils.gateway_for(c) if show_gw else None,
+        } for c in sorted(set(candidates) | chosen)]
+
+        return self.render_page(request, parent, available, bound, {
+            'rows': rows,
+            'length': length,
+            'total_free': total,
+            'selected_count': len(chosen),
+            'conflict_count': len(conflicts),
+            'truncated': total > len(candidates),
+            'show_gateway': show_gw,
         })
 
-    def _create(self, request, data, parent):
-        gateway_status = get_plugin_config(PLUGIN, 'gateway_status')
-        gateway_description = get_plugin_config(PLUGIN, 'gateway_description')
+    def render_page(self, request, parent, available, form, preview=None):
+        summary = utils.space_summary(parent, available)
+        return render(request, self.template_name, {
+            'object': parent,
+            'parent': parent,
+            'form': form,
+            'problems': utils.parent_problems(parent),
+            'policy': utils.policy_label(parent),
+            'summary': summary,
+            'free_blocks': summary['free_blocks'][:64],
+            'free_blocks_more': max(len(summary['free_blocks']) - 64, 0),
+            'vrf_query': self.vrf_query(parent),
+            'max_subnets': cfg('max_subnets'),
+            'preview': preview,
+        })
 
-        with transaction.atomic():
-            # Serialise concurrent wizard runs against the same parent
-            parent = Prefix.objects.select_for_update().get(pk=parent.pk)
-            available = parent.get_available_prefixes()
-            taken = [s for s in data['selected'] if s not in available]
-            if taken:
-                raise _PreviewChanged(taken)
+    @staticmethod
+    def vrf_query(parent):
+        if parent.vrf_id:
+            return f'&vrf_id={parent.vrf_id}'
+        return '' if cfg('global_parent_policy') == 'all_vrfs' else '&vrf_id=null'
 
-            prefixes, addresses = [], []
-            for i, subnet in enumerate(data['selected'], start=1):
-                prefix = Prefix(
-                    prefix=subnet,
-                    vrf=parent.vrf,
-                    scope_type=parent.scope_type,
-                    scope_id=parent.scope_id,
-                    status=data['status'],
-                    role=data['role'],
-                    tenant=data['tenant'],
-                    description=render_description(data['description'] or '', i, subnet),
-                )
-                prefix.full_clean()
-                prefix.save()
-                prefixes.append(prefix)
 
-                gateway = gateway_for(subnet) if data['create_gateway'] else None
-                if gateway is not None:
-                    ip = IPAddress(
-                        address=gateway,
-                        vrf=parent.vrf,
-                        tenant=data['tenant'],
-                        status=gateway_status,
-                        description=gateway_description,
-                    )
-                    ip.full_clean()
-                    ip.save()
-                    addresses.append(ip)
+class ConfirmView(WizardMixin, View):
+    """Shows exactly what will be written; only a signed plan from the review step is accepted."""
+    template_name = 'netbox_subnet_wizard/confirm.html'
 
-            # Enforce NetBox object-level permission constraints, as core views do
-            if Prefix.objects.restrict(request.user, 'add').filter(
-                pk__in=[p.pk for p in prefixes]
-            ).count() != len(prefixes):
-                raise PermissionDenied('A permission constraint prevents creating these prefixes.')
-            if addresses and IPAddress.objects.restrict(request.user, 'add').filter(
-                pk__in=[a.pk for a in addresses]
-            ).count() != len(addresses):
-                raise PermissionDenied('A permission constraint prevents creating these IP addresses.')
+    @classmethod
+    def render_confirm(cls, request, parent, plan, conflicts, errors=None, status=200):
+        n = len(plan.selected)
+        can_convert = (
+            parent.status == PrefixStatusChoices.STATUS_RESERVED
+            and Prefix.objects.restrict(request.user, 'change').filter(pk=parent.pk).exists()
+        )
+        gateway = plan.gateway and utils.gateway_allowed(plan.length, parent.family)
+        return render(request, cls.template_name, {
+            'object': parent,
+            'parent': parent,
+            'plan': plan,
+            'token': plan.sign(),
+            'count': n,
+            'role': Role.objects.filter(pk=plan.role).first() if plan.role else None,
+            'tenant': Tenant.objects.filter(pk=plan.tenant).first() if plan.tenant else None,
+            'status_label': utils.status_label(plan.status),
+            'gateway': gateway,
+            'items': [{
+                'prefix': net,
+                'description': utils.render_description(plan.description, i, net),
+                'gateway': utils.gateway_for(net) if gateway else None,
+                'conflicts': conflicts.get(net, []),
+            } for i, net in enumerate(plan.networks, start=1)],
+            'has_conflicts': bool(conflicts),
+            'needs_typed': n >= cfg('mass_confirm_threshold'),
+            'can_convert': can_convert,
+            'errors': errors or [],
+        }, status=status)
 
-        return prefixes
+    def post(self, request, pk):
+        parent = self.get_parent(request, pk)
+        try:
+            plan = Plan.load(request.POST.get('token', ''), request.user)
+            if plan.parent != parent.pk:
+                raise AllocationError('This review was made for a different parent prefix.')
+        except AllocationError as e:
+            for m in e.messages:
+                messages.error(request, m)
+            return redirect('plugins:netbox_subnet_wizard:allocate', pk=parent.pk)
+
+        if request.POST.get('action') == 'back':
+            data = QueryDict(mutable=True)
+            data.update({
+                'prefix_length': str(plan.length), 'status': plan.status,
+                'role': plan.role or '', 'tenant': plan.tenant or '',
+                'description': plan.description, 'strategy': 'first_fit',
+                'shown_length': str(plan.length),
+            })
+            if plan.gateway:
+                data['create_gateway'] = 'on'
+            data.setlist('selected', plan.selected)
+            return AllocateView().handle(request, parent, data, 'preview')
+
+        conflicts = utils.find_conflicts(parent, plan.networks)
+        n = len(plan.selected)
+        errors = []
+        if n >= cfg('mass_confirm_threshold') and request.POST.get('typed_count', '').strip() != str(n):
+            errors.append(f'Type {n} to confirm creating {n} prefixes.')
+        ack = request.POST.get('acknowledge_conflicts') == 'on'
+        if conflicts and not ack:
+            errors.append('Tick the acknowledgement for prefixes that contain existing IPs or ranges.')
+        if errors:
+            return self.render_confirm(request, parent, plan, conflicts, errors, status=400)
+
+        try:
+            result = allocate(
+                request.user, plan,
+                acknowledge_conflicts=ack,
+                convert_parent=request.POST.get('convert_parent') == 'on',
+            )
+        except (AllocationError, ValidationError, PermissionDenied) as e:
+            # The transaction rolled back; drop the events queued by the provisional saves so
+            # no webhook or event rule fires for objects that do not exist.
+            clear_events.send(sender=self)
+            parent.refresh_from_db()
+            return self.render_confirm(
+                request, parent, plan, utils.find_conflicts(parent, plan.networks),
+                error_messages(e), status=409,
+            )
+        except Exception:
+            clear_events.send(sender=self)
+            raise
+
+        msg = f'Created {len(result.prefixes)} prefix(es) in {parent.prefix}'
+        if result.addresses:
+            msg += f' and {len(result.addresses)} gateway IP(s)'
+        if result.parent_converted:
+            msg += f'; {parent.prefix} is now a container'
+        messages.success(request, msg + '.')
+        if result.late_overlaps:
+            listed = ', '.join(f'{p.prefix} (#{p.pk})' for p in result.late_overlaps)
+            logger.warning('Overlap detected after commit in %s: %s', parent.prefix, listed)
+            messages.error(request, (
+                'Created, but a change made outside the wizard at the same moment overlaps: '
+                f'{listed}. Review and remove the duplicate.'
+            ))
+        return redirect(reverse('ipam:prefix_prefixes', kwargs={'pk': parent.pk}))

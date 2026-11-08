@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netbox-subnet-wizard"
-version = "0.1.0"
-description = "Guided wizard for allocating child prefixes (and optional gateway IPs) in NetBox"
+version = "0.2.0rc1"
+description = "phpIPAM-style splitting and reservation of child prefixes in NetBox"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -16,6 +16,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["netbox_subnet_wizard*"]
+exclude = ["netbox_subnet_wizard.tests*"]
 
 [tool.setuptools.package-data]
 netbox_subnet_wizard = ["templates/netbox_subnet_wizard/*.html"]

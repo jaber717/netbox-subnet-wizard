@@ -1,0 +1,154 @@
+{% extends 'base/layout.html' %}
+{% load form_helpers %}
+{% load helpers %}
+{% load i18n %}
+
+{% block title %}{% trans "Split / Reserve" %} {{ parent.prefix }}{% endblock %}
+
+{% block content %}
+<div class="row">
+
+  {# ---------------------------------------------------------------- free space #}
+  <div class="col col-12 col-xl-4">
+    <div class="card">
+      <h2 class="card-header">{% trans "Parent" %}</h2>
+      <table class="table table-hover attr-table">
+        <tr><th scope="row">{% trans "Prefix" %}</th>
+            <td class="font-monospace"><a href="{{ parent.get_absolute_url }}">{{ parent.prefix }}</a></td></tr>
+        <tr><th scope="row">{% trans "VRF" %}</th><td>{% if parent.vrf %}{{ parent.vrf|linkify }}{% else %}{% trans "Global" %}{% endif %}</td></tr>
+        <tr><th scope="row">{% trans "Scope" %}</th><td>{{ parent.scope|linkify|placeholder }}</td></tr>
+        <tr><th scope="row">{% trans "Status" %}</th><td>{% badge parent.get_status_display bg_color=parent.get_status_color %}</td></tr>
+        <tr><th scope="row">{% trans "Role" %}</th><td>{{ parent.role|linkify|placeholder }}</td></tr>
+        <tr><th scope="row">{% trans "Space rule" %}</th><td class="small">{{ policy }}</td></tr>
+      </table>
+    </div>
+
+    {% if summary.duplicates %}
+      <div class="alert alert-danger small" id="duplicates">
+        <strong>{% trans "Duplicate prefixes in this block:" %}</strong> {{ summary.duplicates|join:", " }}.
+        {% trans "Usually caused by two simultaneous allocations. Remove the extra copy." %}
+      </div>
+    {% endif %}
+    <div class="card">
+      <h2 class="card-header">{% trans "What is available" %}</h2>
+      <div class="card-body pb-1">
+        {% utilization_graph summary.used_pct %}
+        <p class="small text-muted mt-2 mb-2">
+          {% blocktrans with free=summary.free_addresses pct=summary.free_pct %}{{ free }} addresses free ({{ pct }}%).{% endblocktrans %}
+        </p>
+      </div>
+      <table class="table table-hover">
+        <thead><tr><th>{% trans "Already allocated" %}</th><th class="text-end">{% trans "Prefixes" %}</th></tr></thead>
+        <tbody>
+          {% for value, label, n in summary.children_by_status %}
+            <tr>
+              <td><a href="{% url 'ipam:prefix_list' %}?within={{ parent.prefix }}&status={{ value }}{{ vrf_query }}">{{ label }}</a></td>
+              <td class="text-end">{{ n }}</td>
+            </tr>
+          {% empty %}
+            <tr><td colspan="2" class="text-muted">{% trans "Nothing allocated yet." %}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <table class="table table-hover">
+        <thead><tr><th>{% trans "Free blocks" %}</th><th class="text-end">{% trans "Addresses" %}</th></tr></thead>
+        <tbody>
+          {% for block in free_blocks %}
+            <tr><td class="font-monospace">{{ block }}</td><td class="text-end">{{ block.size }}</td></tr>
+          {% empty %}
+            <tr><td colspan="2" class="text-muted">{% trans "No free space." %}</td></tr>
+          {% endfor %}
+          {% if free_blocks_more %}<tr><td colspan="2" class="text-muted small">+{{ free_blocks_more }} {% trans "more" %}</td></tr>{% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {# ---------------------------------------------------------------- split #}
+  <div class="col col-12 col-xl-8">
+    {% if problems %}
+      <div class="alert alert-warning">
+        {% for p in problems %}<div>{{ p }}</div>{% endfor %}
+      </div>
+    {% else %}
+    <form method="post" class="form-object-edit" id="wizard-form">
+      {% csrf_token %}
+      {{ form.shown_length }}
+      {% if form.non_field_errors %}
+        <div class="alert alert-danger">{% for e in form.non_field_errors %}<div>{{ e }}</div>{% endfor %}</div>
+      {% endif %}
+
+      <div class="card">
+        <h2 class="card-header">{% trans "1. Choose the size" %}</h2>
+        <div class="card-body">
+          {% render_field form.prefix_length %}
+          {% render_field form.status %}
+          {% render_field form.role %}
+          {% render_field form.tenant %}
+          {% render_field form.description %}
+          {% render_field form.create_gateway %}
+          {% render_field form.count %}
+          {% render_field form.strategy %}
+          <div class="text-end">
+            <button type="submit" name="action" value="preview" class="btn btn-outline-primary">
+              <i class="mdi mdi-eye"></i> {% trans "Show free blocks" %}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {% if preview %}
+      <div class="card">
+        <h2 class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+          <span>
+            {% blocktrans with length=preview.length total=preview.total_free %}2. Pick the /{{ length }} blocks ({{ total }} free){% endblocktrans %}
+            <span class="badge text-bg-primary ms-1">{{ preview.selected_count }} {% trans "selected" %}</span>
+          </span>
+          <span class="btn-list">
+            <button type="submit" name="action" value="select_all" class="btn btn-sm btn-outline-secondary">{% trans "Select all free" %}</button>
+            <button type="submit" name="action" value="clear" class="btn btn-sm btn-outline-secondary">{% trans "Clear" %}</button>
+            <button type="submit" name="action" value="preview" class="btn btn-sm btn-outline-secondary">{% trans "Refresh" %}</button>
+          </span>
+        </h2>
+        {% if preview.conflict_count %}
+          <div class="alert alert-warning m-2 mb-0 small">
+            {% blocktrans with n=preview.conflict_count %}{{ n }} block(s) contain existing IP addresses or ranges. They are not ticked by "Select all" and need an explicit acknowledgement.{% endblocktrans %}
+          </div>
+        {% endif %}
+        <div class="table-responsive" style="max-height: 60vh; overflow-y: auto;">
+          <table class="table table-hover">
+            <thead><tr>
+              <th></th><th>{% trans "Prefix" %}</th><th>{% trans "Description" %}</th>
+              {% if preview.show_gateway %}<th>{% trans "Gateway" %}</th>{% endif %}
+              <th>{% trans "Notes" %}</th>
+            </tr></thead>
+            <tbody>
+              {% for row in preview.rows %}
+                <tr{% if row.checked %} class="table-active"{% endif %}>
+                  <td><input type="checkbox" class="form-check-input" name="selected" value="{{ row.prefix }}"
+                             id="sel-{{ forloop.counter }}"{% if row.checked %} checked{% endif %}></td>
+                  <td class="font-monospace"><label for="sel-{{ forloop.counter }}">{{ row.prefix }}</label></td>
+                  <td>{{ row.description|placeholder }}</td>
+                  {% if preview.show_gateway %}<td class="font-monospace">{{ row.gateway|placeholder }}</td>{% endif %}
+                  <td>{% for c in row.conflicts %}<span class="badge text-bg-warning me-1">{{ c }}</span>{% endfor %}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="card-footer d-flex justify-content-between align-items-center flex-wrap gap-2">
+          <span class="text-muted small">
+            {% if preview.truncated %}{% blocktrans with shown=preview.rows|length %}Showing the lowest {{ shown }}.{% endblocktrans %} {% endif %}
+            {% blocktrans with max=max_subnets %}Up to {{ max }} per run. After changing ticks, Refresh updates the numbering.{% endblocktrans %}
+          </span>
+          <button type="submit" name="action" value="review" class="btn btn-primary">
+            <i class="mdi mdi-check"></i> {% trans "Review selected" %}
+          </button>
+        </div>
+      </div>
+      {% endif %}
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

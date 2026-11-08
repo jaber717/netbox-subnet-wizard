@@ -1,0 +1,84 @@
+{% extends 'base/layout.html' %}
+{% load helpers %}
+{% load i18n %}
+
+{% block title %}{% trans "Confirm" %}: {{ count }} &times; /{{ plan.length }} in {{ parent.prefix }}{% endblock %}
+
+{% block content %}
+<form method="post" action="{% url 'plugins:netbox_subnet_wizard:confirm' pk=parent.pk %}">
+  {% csrf_token %}
+  <input type="hidden" name="token" value="{{ token }}">
+
+  {% if errors %}
+    <div class="alert alert-danger" id="wizard-errors">{% for e in errors %}<div>{{ e }}</div>{% endfor %}</div>
+  {% endif %}
+
+  <div class="row">
+    <div class="col col-12 col-lg-5">
+      <div class="card">
+        <h2 class="card-header">{% trans "You are about to create" %}</h2>
+        <table class="table attr-table">
+          <tr><th scope="row">{% trans "Prefixes" %}</th><td><strong>{{ count }} &times; /{{ plan.length }}</strong></td></tr>
+          <tr><th scope="row">{% trans "Inside" %}</th><td class="font-monospace"><a href="{{ parent.get_absolute_url }}">{{ parent.prefix }}</a></td></tr>
+          <tr><th scope="row">{% trans "VRF" %}</th><td>{% if parent.vrf %}{{ parent.vrf }}{% else %}{% trans "Global" %}{% endif %}</td></tr>
+          <tr><th scope="row">{% trans "Scope" %}</th><td>{{ parent.scope|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Status" %}</th><td>{{ status_label }}</td></tr>
+          <tr><th scope="row">{% trans "Role" %}</th><td>{{ role|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Tenant" %}</th><td>{{ tenant|placeholder }}</td></tr>
+          <tr><th scope="row">{% trans "Gateway IPs" %}</th><td>{% if gateway %}{{ count }}{% else %}{% trans "None" %}{% endif %}</td></tr>
+        </table>
+        <div class="card-body">
+          {% if has_conflicts %}
+            <div class="form-check mb-3">
+              <input class="form-check-input" type="checkbox" name="acknowledge_conflicts" id="ack">
+              <label class="form-check-label" for="ack">
+                {% trans "Some prefixes contain existing IP addresses or ranges (marked below). Create them anyway." %}
+              </label>
+            </div>
+          {% endif %}
+          {% if can_convert %}
+            <div class="form-check mb-3">
+              <input class="form-check-input" type="checkbox" name="convert_parent" id="convert" checked>
+              <label class="form-check-label" for="convert">
+                {% blocktrans with p=parent.prefix %}Change {{ p }} from Reserved to Container{% endblocktrans %}
+              </label>
+            </div>
+          {% endif %}
+          {% if needs_typed %}
+            <label class="form-label" for="typed">{% blocktrans %}Type <strong>{{ count }}</strong> to confirm this mass allocation{% endblocktrans %}</label>
+            <input type="text" class="form-control mb-3" name="typed_count" id="typed" autocomplete="off" inputmode="numeric">
+          {% endif %}
+          <div class="d-flex justify-content-between">
+            <button type="submit" name="action" value="back" class="btn btn-outline-secondary">{% trans "Back" %}</button>
+            <button type="submit" name="action" value="confirm" class="btn btn-primary">{% blocktrans %}Create {{ count }} prefixes{% endblocktrans %}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col col-12 col-lg-7">
+      <div class="card">
+        <h2 class="card-header">{% trans "Exact list" %}</h2>
+        <div class="table-responsive" style="max-height: 70vh; overflow-y: auto;">
+          <table class="table table-hover">
+            <thead><tr>
+              <th>#</th><th>{% trans "Prefix" %}</th><th>{% trans "Description" %}</th>
+              {% if gateway %}<th>{% trans "Gateway" %}</th>{% endif %}<th>{% trans "Notes" %}</th>
+            </tr></thead>
+            <tbody>
+              {% for item in items %}
+                <tr>
+                  <td class="text-muted">{{ forloop.counter }}</td>
+                  <td class="font-monospace">{{ item.prefix }}</td>
+                  <td>{{ item.description|placeholder }}</td>
+                  {% if gateway %}<td class="font-monospace">{{ item.gateway|placeholder }}</td>{% endif %}
+                  <td>{% for c in item.conflicts %}<span class="badge text-bg-warning me-1">{{ c }}</span>{% endfor %}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</form>
+{% endblock %}
