@@ -110,17 +110,23 @@ PLUGINS_CONFIG = {
 
 No runtime dependencies beyond NetBox. Pin a tag; never install a moving branch.
 
+Python 3.12 venvs (NetBox's included) do not contain `setuptools`, which builds this package.
+Pick one:
+
 ```bash
-# Build backend comes from NetBox's own venv, so pip does not need PyPI:
+# A) Let pip fetch the build backend through your proxy (PyPI must be reachable):
+sudo /opt/netbox/venv/bin/pip install \
+  "git+https://github.com/<your-org>/netbox-subnet-wizard.git@v0.2.0rc1"
+
+# B) No PyPI at install time: add the build backend once, then build without isolation.
+sudo /opt/netbox/venv/bin/pip install "setuptools>=68" wheel      # once, via proxy or a mirror
 sudo /opt/netbox/venv/bin/pip install --no-build-isolation \
   "git+https://github.com/<your-org>/netbox-subnet-wizard.git@v0.2.0rc1"
-echo 'git+https://github.com/<your-org>/netbox-subnet-wizard.git@v0.2.0rc1' | sudo tee -a /opt/netbox/local_requirements.txt
 ```
 
-Behind an SSL-inspecting proxy, point git at the corporate CA
-(`git config --global http.sslCAInfo /etc/pki/ca-trust/source/anchors/corp.pem`) and export
-`https_proxy`. `--no-build-isolation` requires `setuptools>=68` and `wheel` in the NetBox venv
-(present in standard installs; check with `pip show setuptools wheel`).
+Record the same `git+https://...@v0.2.0rc1` line in `/opt/netbox/local_requirements.txt` so
+`upgrade.sh` reinstalls it. Behind an SSL-inspecting proxy, point git and pip at the corporate CA
+(`git config --global http.sslCAInfo <ca.pem>`, `PIP_CERT=<ca.pem>`) and export `https_proxy`.
 
 Add `'netbox_subnet_wizard'` to `PLUGINS`, then:
 
